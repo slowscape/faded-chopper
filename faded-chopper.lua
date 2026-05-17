@@ -1,16 +1,9 @@
 --
--- FADEDddDD
+-- FADEDddDD Chopper
 --
 -- Devine Lu Linvega's simple softcut example 
 -- slammed together with SAM,
 -- plus some unique additions.
---
--- Sample volume visualized through brightness. 
--- Samples copied with a fade before saved
--- so that clicking is less likely.
--- 
--- Samples numbered in a folder.
--- Samples should not be more that ~2.5 minutes.
 --
 -- key1       - alt
 -- key2       - start/stop record
@@ -23,7 +16,7 @@
 -- alt + enc2 - loop start (coarse)
 -- alt + enc3 - loop end (coarse)
 --
--- v1.5 @slowscape
+-- v1.6 @slowscape
 
 
 local te = require 'textentry'
@@ -45,6 +38,13 @@ local screen_timer = nil
 
 local FADE_TIME   = 0.01   -- fade in/out baked into each saved sample (seconds)
 
+-- waveform
+local waveform      = {}
+local waveform_ceil = 1.0  -- top-N% average, used as brightness ceiling
+local WAVEFORM_W    = 112  -- one sample per pixel column
+local TOP_PCT       = 0.15 -- top 15% of amplitudes averaged for ceiling
+
+
 -- ---------------------------------------------------------------
 -- helpers
 -- ---------------------------------------------------------------
@@ -58,13 +58,13 @@ function check(txt)
 end
 
 
-local function scan_last_index(folder_path)
+local function scan_last_index(folder_path, last_used_folder)
   local highest = 0
   if util.file_exists(folder_path) then
     local files = util.scandir(folder_path)
     if files then
       for _, f in ipairs(files) do
-        local n = string.match(f, "^samz%-(%d+)%.wav$")
+        local n = string.match(f, "^".. last_used_folder .. "%-(%d+)%.wav$")
         if n then
           local idx = tonumber(n)
           if idx > highest then highest = idx end
@@ -73,6 +73,32 @@ local function scan_last_index(folder_path)
     end
   end
   return highest
+end
+
+
+local function request_waveform()
+  softcut.render_buffer(1, 0, recorded_length, WAVEFORM_W)
+end
+
+local function on_render(ch, start, dur, samples)
+  waveform = samples
+
+  -- build sorted list of absolute amplitudes
+  local amps = {}
+  for _, s in ipairs(samples) do
+    table.insert(amps, math.abs(s))
+  end
+  table.sort(amps)
+
+  -- average the top TOP_PCT of values
+  local n       = #amps
+  local top_n   = math.max(1, math.floor(n * TOP_PCT))
+  local sum     = 0
+  for i = n - top_n + 1, n do
+    sum = sum + amps[i]
+  end
+  local avg_top = sum / top_n
+  waveform_ceil = avg_top > 0 and avg_top or 1.0
 end
 
 
@@ -102,6 +128,7 @@ local function reset_loop()
   softcut.position(1, 0)
   softcut.position(2, 0)
   current_position = 0
+  waveform = {}
 end
 
 
@@ -128,46 +155,45 @@ local function load_sample(file)
   playing = true
   softcut.play(1, 1)
   softcut.play(2, 1)
+  request_waveform()
 end
 
 
 -- ---------------------------------------------------------------
--- write buffer (copy with baked fades then save)
+-- write buffer
 -- ---------------------------------------------------------------
 
-local SCRATCH_PAD = 1.0    -- gap between recorded_length and scratch region (seconds)
-local TOTAL_BUF   = 350.0  -- total softcut buffer length
+local SCRATCH_PAD = 1.0
+local TOTAL_BUF   = 350.0
 
 function write_buffer(name)
   if name == nil or check(name) == "too long" then return end
   last_used_folder = name
-  local folder_path = _path.audio .. "a-samples/" .. last_used_folder
+  print("NAMES: " .. last_used_folder)
+  local folder_path = _path.audio .. "a-samples/fc/" .. last_used_folder
 
   if util.file_exists(folder_path) == false then
     util.make_dir(folder_path)
   end
 
-  last_saved_name = scan_last_index(folder_path) + 1
+  last_saved_name = scan_last_index(folder_path, last_used_folder) + 1
 
   local dur         = loop_end - loop_start
   local scratch_dst = recorded_length + SCRATCH_PAD
 
-  -- safety check: make sure the scratch region fits in the buffer
   if scratch_dst + dur > TOTAL_BUF then
-    print("samz: not enough buffer space to bake fades — saving without fade")
-    local file_path = folder_path .. "/fc-" .. string.format("%03d", last_saved_name) .. ".wav"
+    print("not enough buffer space to bake fades — saving without fade")
+    local file_path = folder_path .. "/" .. last_used_folder.. "-" .. string.format("%03d", last_saved_name) .. ".wav"
     softcut.buffer_write_stereo(file_path, loop_start, dur)
     saved_time = util.time()
     return
   end
 
-  -- copy selected region to scratch space with fade baked in
-  -- buffer_copy_stereo(start_src, start_dst, dur, fade_time, preserve, reverse)
   softcut.buffer_copy_stereo(loop_start, scratch_dst, dur, FADE_TIME, 0, 0)
 
   clock.run(function()
-    clock.sleep(0.1)  -- brief yield so copy command clears the audio engine queue
-    local file_path = folder_path .. "/fc-" .. string.format("%03d", last_saved_name) .. ".wav"
+    clock.sleep(0.1)
+    local file_path = folder_path .. "/" .. last_used_folder.. "-" .. string.format("%03d", last_saved_name) .. ".wav"
     softcut.buffer_write_stereo(file_path, scratch_dst, dur)
     print("Buffer saved as " .. file_path)
     saved_time = util.time()
@@ -237,6 +263,7 @@ function init()
   softcut.phase_quant(1, 0.01)
   softcut.event_phase(update_positions)
   softcut.poll_start_phase()
+  softcut.event_render(on_render)
 
   screen_timer = metro.init()
   screen_timer.time = 1 / 15
@@ -256,7 +283,8 @@ function key(n, z)
 
   if n == 2 and z == 1 then
     if alt then
-      local browse_path = _path.audio .. "a-samples/"
+      local browse_path = _path.audio
+      --local browse_path = _path.audio .. "a-samples/fc/" -- Direct to samples folder
       if util.file_exists(browse_path) == false then
         util.make_dir(browse_path)
       end
@@ -293,6 +321,7 @@ function key(n, z)
           softcut.rec_level(2, 1)
           recording = false
           playing = true
+          request_waveform()
         end)
       end
     end
@@ -375,17 +404,33 @@ function redraw()
     pad, width, bar_scale
   )
 
-  -- dim background (full recorded length)
-  screen.level(2)
-  screen.move(x_left, bar_y)
-  screen.line(x_right, bar_y)
-  screen.stroke()
-
-  -- active region between in/out points
-  screen.level(recording and 10 or (playing and 15 or 5))
-  screen.move(x_start, bar_y)
-  screen.line(x_end, bar_y)
-  screen.stroke()
+  -- waveform line: per-pixel brightness inside selection, flat dim outside
+  if #waveform == 0 or recording then
+    -- no data yet: draw simple lines as before
+    screen.level(2)
+    screen.move(x_left, bar_y)
+    screen.line(x_right, bar_y)
+    screen.stroke()
+    screen.level(recording and 10 or (playing and 15 or 5))
+    screen.move(x_start, bar_y)
+    screen.line(x_end, bar_y)
+    screen.stroke()
+  else
+    for i, s in ipairs(waveform) do
+      local sx = pad + (i - 1)
+      local in_region = sx >= x_start and sx <= x_end
+      if in_region then
+        -- normalise against top-N% ceiling, clamp so outliers hit max
+        local normalised = util.clamp(math.abs(s) / waveform_ceil, 0, 1)
+        local lvl = math.floor(util.linlin(0, 1, 4, 15, normalised))
+        screen.level(lvl)
+      else
+        screen.level(3)
+      end
+      screen.pixel(sx, bar_y)
+      screen.fill()
+    end
+  end
 
   -- playhead tick
   if playing or recording then
@@ -462,7 +507,7 @@ function redraw()
   if util.time() - saved_time <= 1.5 then
     screen.level(4)
     screen.move(viewport.center, bar_y - 10)
-    screen.text_center("saved samz-" .. string.format("%03d", last_saved_name) .. ".wav")
+    screen.text_center("saved:" .. last_used_folder .."-".. string.format("%03d", last_saved_name) .. ".wav")
   end
 
   screen.update()
